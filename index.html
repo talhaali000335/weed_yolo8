@@ -2,10 +2,11 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-    <title>AgriVision AI • Live Weed & Crop Detection (ONNX Runtime Web)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+    <title>AgriVision AI • Live Weed & Crop Detection</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.21.0/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/kalman-filter@2.0.2/dist/kalman-filter.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Inter', sans-serif; background: #000; color: #fff; overflow: hidden; height: 100vh; }
@@ -52,10 +53,12 @@
             display: flex; justify-content: center; gap: 16px; margin-top: 20px;
         }
         button {
-            padding: 14px 28px; font-size: 1.1rem; border: none;
-            border-radius: 30px; cursor: pointer; transition: all 0.3s;
+            background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);
+            color: white; padding: 14px 28px; border-radius: 30px; cursor: pointer;
+            font-weight: 600; transition: all 0.3s;
         }
-        #reset-btn { background: #ff4444; color: white; }
+        button:hover { background: rgba(255,255,255,0.2); }
+        #reset-btn { background: #ff4444; border-color: #ff4444; }
         #reset-btn:hover { background: #ff3333; }
 
         .confidence {
@@ -121,7 +124,7 @@
         const confText = document.getElementById('conf-text');
         const resetBtn = document.getElementById('reset-btn');
 
-        let session;
+        let model;
         let isRunning = true;
         let frameCount = 0;
 
@@ -133,9 +136,9 @@
         async function loadModel() {
             try {
                 statusText.textContent = "Loading YOLOv11 model...";
-                const session = await ort.InferenceSession.create('best_web_model/model.onnx');
+                model = await tf.loadGraphModel('best_model_web/model.json');
                 statusText.textContent = "Model loaded – detecting live!";
-                console.log("ONNX model loaded");
+                console.log("YOLOv11 model loaded");
                 startDetection();
             } catch (e) {
                 statusText.textContent = "Failed to load model";
@@ -182,157 +185,147 @@
             const normalized = resized.div(255.0);
             const input = normalized.expandDims(0);
 
-            // ONNX Runtime Web inference
-            try {
-                const feeds = { images: input };
-                const results = await session.run(feeds);
-                const output = results.output_0; // assuming output named "output_0" in ONNX
+            const prediction = await model.executeAsync(input);
+            let output = Array.isArray(prediction) ? prediction[0] : prediction;
 
-                // Shape: [1, 8400, 6] for 2 classes
-                const data = await output.data();
-                const numBoxes = 8400;
+            if (output.shape[1] === 6 && output.shape[2] === 8400) {
+                output = output.transpose([0, 2, 1]);
+            }
 
-                const detections = [];
-                const threshold = 0.4;
+            const data = await output.array();
+            const boxes = data[0];
 
-                for (let i = 0; i < numBoxes; i++) {
-                    const offset = i * 6;
-                    const cx = data[offset];
-                    const cy = data[offset + 1];
-                    const w = data[offset + 2];
-                    const h = data[offset + 3];
-                    const weedConf = data[offset + 4];
-                    const cropConf = data[offset + 5];
+            const currentDetections = [];
+            const threshold = 0.4;
 
-                    const conf = Math.max(weedConf, cropConf);
-                    if (conf < threshold) continue;
+            for (let i = 0; i < boxes.length; i++) {
+                const [cx, cy, w, h, conf1, conf2] = boxes[i];
+                const conf = Math.max(conf1, conf2);
+                if (conf < threshold) continue;
 
-                    const classId = weedConf > cropConf ? 0 : 1;
-                    const x = (cx - w / 2) * 640;
-                    const y = (cy - h / 2) * 640;
-                    const width = w * 640;
-                    const height = h * 640;
+                const classId = conf1 > conf2 ? 0 : 1; // 0=weed, 1=crop
+                const x = (cx - w / 2) * 640;
+                const y = (cy - h / 2) * 640;
+                const width = w * 640;
+                const height = h * 640;
 
-                    detections.push({
-                        bbox: [x, y, x + width, y + height],
-                        confidence: conf,
-                        classId
+                currentDetections.push({
+                    bbox: [x, y, x + width, y + height],
+                    confidence: conf,
+                    classId
+                });
+            }
+
+            // Simple SORT-like tracking
+            const matched = new Set();
+            const newTrackers = new Map();
+
+            currentDetections.forEach(det => {
+                let bestMatch = null;
+                let bestIou = 0;
+
+                trackers.forEach((tracker, id) => {
+                    const i = iou(det.bbox, tracker.bbox);
+                    if (i > bestIou && i > 0.3) {
+                        bestIou = i;
+                        bestMatch = id;
+                    }
+                });
+
+                if (bestMatch !== null) {
+                    matched.add(bestMatch);
+                    const t = trackers.get(bestMatch);
+                    t.bbox = det.bbox;
+                    t.confidence = det.confidence;
+                    t.age = 0;
+                    t.totalVisibleCount++;
+                    newTrackers.set(bestMatch, t);
+                } else {
+                    const id = nextId++;
+                    const label = det.classId === 0 ? `WEED #${id}` : `CROP #${id}`;
+                    newTrackers.set(id, {
+                        bbox: det.bbox,
+                        classId: det.classId,
+                        label,
+                        confidence: det.confidence,
+                        age: 0,
+                        totalVisibleCount: 1
                     });
                 }
+            });
 
-                // Simple SORT-like tracking
-                const matched = new Set();
-                const newTrackers = new Map();
+            // Age old trackers
+            trackers.forEach((t, id) => {
+                if (!matched.has(id)) {
+                    t.age++;
+                    if (t.age < 30) newTrackers.set(id, t); // keep for 30 frames
+                }
+            });
 
-                detections.forEach(det => {
-                    let bestMatch = null;
-                    let bestIou = 0;
+            trackers.clear();
+            newTrackers.forEach((t, id) => trackers.set(id, t));
 
-                    trackers.forEach((tracker, id) => {
-                        const i = iou(det.bbox, tracker.bbox);
-                        if (i > bestIou && i > 0.3) {
-                            bestIou = i;
-                            bestMatch = id;
-                        }
-                    });
+            // Draw
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-                    if (bestMatch !== null) {
-                        matched.add(bestMatch);
-                        const t = trackers.get(bestMatch);
-                        t.bbox = det.bbox;
-                        t.confidence = det.confidence;
-                        t.age = 0;
-                        t.totalVisibleCount++;
-                        newTrackers.set(bestMatch, t);
-                    } else {
-                        const id = nextId++;
-                        const label = det.classId === 0 ? `WEED #${id}` : `CROP #${id}`;
-                        newTrackers.set(id, {
-                            bbox: det.bbox,
-                            classId: det.classId,
-                            label,
-                            confidence: det.confidence,
-                            age: 0,
-                            totalVisibleCount: 1
-                        });
-                    }
-                });
+            let visibleWeeds = 0;
+            let visibleCrops = 0;
+            let sumConf = 0;
 
-                trackers.forEach((t, id) => {
-                    if (!matched.has(id)) {
-                        t.age++;
-                        if (t.age < 30) newTrackers.set(id, t);
-                    }
-                });
+            trackers.forEach(t => {
+                if (t.age > 0) return; // only draw visible
 
-                trackers.clear();
-                newTrackers.forEach((t, id) => trackers.set(id, t));
+                const [x1, y1, x2, y2] = t.bbox;
+                const scaleX = canvas.width / 640;
+                const scaleY = canvas.height / 640;
 
-                // Draw
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                const sx1 = x1 * scaleX;
+                const sy1 = y1 * scaleY;
+                const sx2 = x2 * scaleX;
+                const sy2 = y2 * scaleY;
 
-                let visibleWeeds = 0;
-                let visibleCrops = 0;
-                let sumConf = 0;
+                const isWeed = t.classId === 0;
+                const color = isWeed ? '#ff4444' : '#44ff44';
 
-                trackers.forEach(t => {
-                    if (t.age > 0) return; // only draw visible
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 4;
+                ctx.strokeRect(sx1, sy1, sx2 - sx1, sy2 - sy1);
 
-                    const [x1, y1, x2, y2] = t.bbox;
-                    const scaleX = canvas.width / 640;
-                    const scaleY = canvas.height / 640;
+                const label = `${t.label} ${(t.confidence * 100).toFixed(0)}%`;
+                const textWidth = ctx.measureText(label).width;
 
-                    const sx1 = x1 * scaleX;
-                    const sy1 = y1 * scaleY;
-                    const sx2 = x2 * scaleX;
-                    const sy2 = y2 * scaleY;
+                ctx.fillStyle = color;
+                ctx.fillRect(sx1, sy1 - 34, textWidth + 20, 34);
 
-                    const isWeed = t.classId === 0;
-                    const color = isWeed ? '#ff4444' : '#44ff44';
+                ctx.fillStyle = 'white';
+                ctx.font = 'bold 16px Inter';
+                ctx.fillText(label, sx1 + 10, sy1 - 10);
 
-                    ctx.strokeStyle = color;
-                    ctx.lineWidth = 4;
-                    ctx.strokeRect(sx1, sy1, sx2 - sx1, sy2 - sy1);
+                if (isWeed) visibleWeeds++;
+                else visibleCrops++;
+                sumConf += t.confidence;
+            });
 
-                    const label = `${t.label} ${(t.confidence * 100).toFixed(0)}%`;
-                    const textWidth = ctx.measureText(label).width;
+            // Update UI
+            weedCount.textContent = visibleWeeds;
+            cropCount.textContent = visibleCrops;
+            totalCount.textContent = visibleWeeds + visibleCrops;
+            const avg = visibleWeeds + visibleCrops > 0 ? sumConf / (visibleWeeds + visibleCrops) : 0;
+            confFill.style.width = `${avg * 100}%`;
+            confText.textContent = `${(avg * 100).toFixed(1)}%`;
 
-                    ctx.fillStyle = color;
-                    ctx.fillRect(sx1, sy1 - 34, textWidth + 20, 34);
-
-                    ctx.fillStyle = 'white';
-                    ctx.font = 'bold 16px Inter';
-                    ctx.fillText(label, sx1 + 10, sy1 - 10);
-
-                    if (isWeed) visibleWeeds++;
-                    else visibleCrops++;
-                    sumConf += t.confidence;
-                });
-
-                // Update UI
-                weedCount.textContent = visibleWeeds;
-                cropCount.textContent = visibleCrops;
-                totalCount.textContent = visibleWeeds + visibleCrops;
-                const avg = visibleWeeds + visibleCrops > 0 ? sumConf / (visibleWeeds + visibleCrops) : 0;
-                confFill.style.width = `${avg * 100}%`;
-                confText.textContent = `${(avg * 100).toFixed(1)}%`;
-
-                tf.engine().endScope();
-                requestAnimationFrame(startDetection);
-            } catch (e) {
-                console.error("Detection error:", e);
-                statusText.textContent = "Detection error";
-                requestAnimationFrame(startDetection);
-            }
+            tf.engine().endScope();
+            requestAnimationFrame(startDetection);
         }
 
-        // Reset
+        // Reset button
         resetBtn.onclick = () => {
             nextId = 1;
             trackers.clear();
             statusText.textContent = "Counts reset";
         };
 
+        // Start everything
         startCamera();
         loadModel();
     </script>
