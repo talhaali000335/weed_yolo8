@@ -133,7 +133,7 @@
         async function loadModel() {
             try {
                 statusText.textContent = "Loading YOLOv11 model...";
-                session = await ort.InferenceSession.create('best_model_web/model.json');
+                session = ort.InferenceSession.create('best_model_web/model.json');
                 statusText.textContent = "Model loaded – detecting live!";
                 console.log("ONNX model loaded");
                 startDetection();
