@@ -6,16 +6,12 @@
     <title>AgriVision AI • Live Weed & Crop Detection</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.21.0/dist/tf.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/kalman-filter@2.0.2/dist/kalman-filter.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Inter', sans-serif; background: #000; color: #fff; overflow: hidden; height: 100vh; }
         .container { position: relative; width: 100%; height: 100%; background: #000; }
-
         video { width: 100%; height: 100%; object-fit: cover; }
-
         canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
-
         .status-bar {
             position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
             background: rgba(0,0,0,0.7); backdrop-filter: blur(16px);
@@ -24,7 +20,6 @@
             font-weight: 600; font-size: 14px;
         }
         .dot { width: 10px; height: 10px; border-radius: 50%; background: #00ff88; display: inline-block; margin-right: 10px; box-shadow: 0 0 20px #00ff88; }
-
         .bottom-panel {
             position: absolute; bottom: 0; left: 0; right: 0; z-index: 50;
             background: rgba(10,10,15,0.95); backdrop-filter: blur(20px);
@@ -37,7 +32,6 @@
             width: 50px; height: 5px; background: rgba(255,255,255,0.3); border-radius: 3px;
             margin: 0 auto 16px; cursor: grab;
         }
-
         .stats {
             display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; text-align: center;
         }
@@ -48,19 +42,15 @@
         .stat-icon { font-size: 32px; margin-bottom: 8px; }
         .stat-count { font-size: 36px; font-weight: 700; margin: 8px 0; }
         .stat-label { font-size: 13px; opacity: 0.8; }
-
         .controls {
             display: flex; justify-content: center; gap: 16px; margin-top: 20px;
         }
         button {
-            background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);
-            color: white; padding: 14px 28px; border-radius: 30px; cursor: pointer;
-            font-weight: 600; transition: all 0.3s;
+            padding: 14px 28px; font-size: 1.1rem; border: none;
+            border-radius: 30px; cursor: pointer; transition: all 0.3s;
         }
-        button:hover { background: rgba(255,255,255,0.2); }
-        #reset-btn { background: #ff4444; border-color: #ff4444; }
+        #reset-btn { background: #ff4444; color: white; }
         #reset-btn:hover { background: #ff3333; }
-
         .confidence {
             margin-top: 16px; text-align: center;
         }
@@ -113,6 +103,14 @@
     </div>
 
     <script>
+        // ───────────────────────────────────────────────
+        // ADJUST THESE TWO VALUES HERE to control detection
+        // ───────────────────────────────────────────────
+        const MIN_CONFIDENCE = 0.65;   // 0.4–0.65 range recommended (higher = fewer false positives)
+        const IOU_THRESHOLD  = 0.6;   // 0.3–0.6 range (higher = stricter matching)
+        const TRACKER_MAX_AGE = 15;    // frames a tracker survives without match (was 30, lowered)
+        // ───────────────────────────────────────────────
+
         const video = document.getElementById('video');
         const canvas = document.getElementById('canvas');
         const ctx = canvas.getContext('2d');
@@ -130,36 +128,40 @@
 
         // Tracking
         let nextId = 1;
-        const trackers = new Map(); // id → {bbox, class, label, age, totalVisibleCount}
+        const trackers = new Map(); // id → {bbox, classId, label, age, visibleCount}
 
-        // Load model
         async function loadModel() {
             try {
                 statusText.textContent = "Loading YOLOv11 model...";
                 model = await tf.loadGraphModel('best_model_web/model.json');
                 statusText.textContent = "Model loaded – detecting live!";
-                console.log("YOLOv11 model loaded");
+                console.log("Model loaded successfully");
                 startDetection();
             } catch (e) {
                 statusText.textContent = "Failed to load model";
-                console.error(e);
+                console.error("Model load error:", e);
             }
         }
 
-        // Webcam
         async function startCamera() {
-            const stream = await navigator.mediaDevices.getUserMedia({
-                video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
-            });
-            video.srcObject = stream;
-            video.onloadedmetadata = () => {
-                video.play();
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-            };
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+                });
+                video.srcObject = stream;
+                video.onloadedmetadata = () => {
+                    video.play();
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    console.log("Camera started:", video.videoWidth, "×", video.videoHeight);
+                };
+            } catch (e) {
+                console.error("Camera error:", e);
+                statusText.textContent = "Camera access denied";
+            }
         }
 
-        // Simple IOU for tracking
+        // IOU calculation
         function iou(box1, box2) {
             const [x1, y1, x2, y2] = box1;
             const [xA, yA, xB, yB] = box2;
@@ -173,7 +175,6 @@
             return interArea / (box1Area + box2Area - interArea);
         }
 
-        // Main detection loop
         async function startDetection() {
             if (!isRunning) return;
 
@@ -185,7 +186,16 @@
             const normalized = resized.div(255.0);
             const input = normalized.expandDims(0);
 
-            const prediction = await model.executeAsync(input);
+            let prediction;
+            try {
+                prediction = await model.executeAsync(input);
+            } catch (e) {
+                console.error("Inference error:", e);
+                tf.engine().endScope();
+                requestAnimationFrame(startDetection);
+                return;
+            }
+
             let output = Array.isArray(prediction) ? prediction[0] : prediction;
 
             if (output.shape[1] === 6 && output.shape[2] === 8400) {
@@ -195,15 +205,15 @@
             const data = await output.array();
             const boxes = data[0];
 
-            const currentDetections = [];
-            const threshold = 0.4;
+            console.log(`Frame ${frameCount} - Raw boxes before filter: ${boxes.length}`);
 
+            const currentDetections = [];
             for (let i = 0; i < boxes.length; i++) {
                 const [cx, cy, w, h, conf1, conf2] = boxes[i];
                 const conf = Math.max(conf1, conf2);
-                if (conf < threshold) continue;
+                if (conf < MIN_CONFIDENCE) continue;
 
-                const classId = conf1 > conf2 ? 0 : 1; // 0=weed, 1=crop
+                const classId = conf1 > conf2 ? 0 : 1;
                 const x = (cx - w / 2) * 640;
                 const y = (cy - h / 2) * 640;
                 const width = w * 640;
@@ -216,7 +226,9 @@
                 });
             }
 
-            // Simple SORT-like tracking
+            console.log(`After confidence filter (${MIN_CONFIDENCE}): ${currentDetections.length} detections`);
+
+            // ─── SORT-like tracking ───────────────────────────────────────
             const matched = new Set();
             const newTrackers = new Map();
 
@@ -226,7 +238,7 @@
 
                 trackers.forEach((tracker, id) => {
                     const i = iou(det.bbox, tracker.bbox);
-                    if (i > bestIou && i > 0.3) {
+                    if (i > bestIou && i > IOU_THRESHOLD) {
                         bestIou = i;
                         bestMatch = id;
                     }
@@ -238,7 +250,7 @@
                     t.bbox = det.bbox;
                     t.confidence = det.confidence;
                     t.age = 0;
-                    t.totalVisibleCount++;
+                    t.visibleCount++;
                     newTrackers.set(bestMatch, t);
                 } else {
                     const id = nextId++;
@@ -249,31 +261,36 @@
                         label,
                         confidence: det.confidence,
                         age: 0,
-                        totalVisibleCount: 1
+                        visibleCount: 1
                     });
                 }
             });
 
-            // Age old trackers
+            // Age & remove old trackers
             trackers.forEach((t, id) => {
                 if (!matched.has(id)) {
                     t.age++;
-                    if (t.age < 30) newTrackers.set(id, t); // keep for 30 frames
+                    if (t.age <= TRACKER_MAX_AGE) {
+                        newTrackers.set(id, t);
+                    }
                 }
             });
 
             trackers.clear();
             newTrackers.forEach((t, id) => trackers.set(id, t));
 
-            // Draw
+            console.log(`Active trackers after update: ${trackers.size}`);
+
+            // ─── Draw ─────────────────────────────────────────────────────
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
             let visibleWeeds = 0;
             let visibleCrops = 0;
             let sumConf = 0;
+            let visibleCount = 0;
 
             trackers.forEach(t => {
-                if (t.age > 0) return; // only draw visible
+                if (t.age > 2) return; // only draw very fresh detections
 
                 const [x1, y1, x2, y2] = t.bbox;
                 const scaleX = canvas.width / 640;
@@ -304,13 +321,15 @@
                 if (isWeed) visibleWeeds++;
                 else visibleCrops++;
                 sumConf += t.confidence;
+                visibleCount++;
             });
 
-            // Update UI
+            // Update UI only with visible (fresh) detections
             weedCount.textContent = visibleWeeds;
             cropCount.textContent = visibleCrops;
             totalCount.textContent = visibleWeeds + visibleCrops;
-            const avg = visibleWeeds + visibleCrops > 0 ? sumConf / (visibleWeeds + visibleCrops) : 0;
+
+            const avg = visibleCount > 0 ? sumConf / visibleCount : 0;
             confFill.style.width = `${avg * 100}%`;
             confText.textContent = `${(avg * 100).toFixed(1)}%`;
 
@@ -318,14 +337,14 @@
             requestAnimationFrame(startDetection);
         }
 
-        // Reset button
+        // Reset
         resetBtn.onclick = () => {
             nextId = 1;
             trackers.clear();
-            statusText.textContent = "Counts reset";
+            statusText.textContent = "Counts & trackers reset";
         };
 
-        // Start everything
+        // Start
         startCamera();
         loadModel();
     </script>
